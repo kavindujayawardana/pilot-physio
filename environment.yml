@@ -1,0 +1,24 @@
+name: pilot-physio-env
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pandas
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - mne
+  - pyarrow
+  - statsmodels
+  - xgboost
+  - pip
+  - pip:
+      - neurokit2
+      - torch
+      - pyyaml
+      - wandb
+      - pytest
+      - flake8

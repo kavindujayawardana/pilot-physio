@@ -1,0 +1,16 @@
+pandas
+numpy
+scipy
+scikit-learn
+matplotlib
+seaborn
+mne
+neurokit2
+pyarrow
+statsmodels
+xgboost
+torch
+pyyaml
+wandb
+pytest
+flake8
