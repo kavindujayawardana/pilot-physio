@@ -1,0 +1,16 @@
+raw/
+processed/
+preprocessed/
+windows/
+features/
+models/
+results/
+
+*.parquet
+*.npy
+*.ckpt
+
+.env
+.vscode/
+__pycache__/
+.ipynb_checkpoints/
