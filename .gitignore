@@ -19,3 +19,5 @@ qc_report/
 qc_summary.csv
 
 preprocessed/
+
+processed/**/norms.json
