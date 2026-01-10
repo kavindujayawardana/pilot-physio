@@ -21,3 +21,6 @@ qc_summary.csv
 preprocessed/
 
 processed/**/norms.json
+
+windows/
+*.npy
