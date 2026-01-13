@@ -24,3 +24,9 @@ processed/**/norms.json
 
 windows/
 *.npy
+
+features/
+windows/
+*.npy
+.DS_Store
+**/.DS_Store
