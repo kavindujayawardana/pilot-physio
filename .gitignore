@@ -30,3 +30,9 @@ windows/
 *.npy
 .DS_Store
 **/.DS_Store
+
+results/
+results/eda/
+*.png
+*.pdf
+results/eda/*.csv
