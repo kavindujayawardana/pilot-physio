@@ -41,6 +41,7 @@ def load_subject_crew_id(processed_root: Path, subject_id: str) -> str | None:
 def clean_event_column(df: pd.DataFrame, subject_id: str, session_name: str) -> pd.DataFrame:
     """
     Make Event safe and deterministic:
+    - if missing -> create all zeros
     - coerce to numeric
     - replace +/-inf with NaN
     - fill NaN with 0 (baseline)
@@ -52,8 +53,9 @@ def clean_event_column(df: pd.DataFrame, subject_id: str, session_name: str) -> 
         return df
 
     raw = pd.to_numeric(df["Event"], errors="coerce")
-    n_nan = int(raw.isna().sum())
-    n_inf = int(np.isinf(raw.to_numpy(dtype=float, copy=False)).sum())
+    arr = raw.to_numpy(dtype=float, copy=False)
+    n_nan = int(np.isnan(arr).sum())
+    n_inf = int(np.isinf(arr).sum())
 
     if (n_nan + n_inf) > 0:
         print(f"[WARN] {subject_id}/{session_name}: Event had {n_nan} NaN and {n_inf} inf values -> filled with 0")
@@ -76,23 +78,28 @@ def ensure_timesecs(df: pd.DataFrame, subject_id: str, session_name: str) -> pd.
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Window and label preprocessed sessions.")
+    parser = argparse.ArgumentParser(
+        description="Window and label preprocessed sessions (supports keeping transition windows)."
+    )
     parser.add_argument("--preprocessed", required=True, help="Path to preprocessed/")
     parser.add_argument("--processed", required=True, help="Path to processed/ (for metadata like crewID)")
     parser.add_argument("--out", default="./windows", help="Output windows directory")
-    parser.add_argument("--window-len", type=float, default=2.0, help="Window length in seconds")
-    parser.add_argument("--step", type=float, default=1.0, help="Step size in seconds")
+
+    # ✅ Changed defaults for near real-time:
+    parser.add_argument("--window-len", type=float, default=5.0, help="Window length in seconds (default: 5.0)")
+    parser.add_argument("--step", type=float, default=1.0, help="Step size in seconds (default: 1.0)")
+
     parser.add_argument(
         "--transition-threshold",
         type=float,
         default=0.20,
-        help="Transition overlap threshold (0.20 means keep only if top label >= 0.80)",
+        help="Transition overlap threshold (0.20 means purity must be >= 0.80).",
     )
     parser.add_argument(
         "--bad-frac-threshold",
         type=float,
         default=0.20,
-        help="Mark window bad if fraction of bad samples exceeds this",
+        help="Mark window bad if fraction of bad samples exceeds this.",
     )
     args = parser.parse_args()
 
@@ -101,9 +108,9 @@ def main() -> int:
     out_root = Path(args.out).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    win_len_samples = int(args.window_len * FS)              # 2.0s -> 512
-    step_samples = int(args.step * FS)                       # 1.0s -> 256
-    keep_frac = 1.0 - float(args.transition_threshold)       # 0.20 -> 0.80
+    win_len_samples = int(round(args.window_len * FS))          # 5.0s -> 1280
+    step_samples = int(round(args.step * FS))                   # 1.0s -> 256
+    keep_frac = 1.0 - float(args.transition_threshold)          # 0.20 -> 0.80
 
     # Find all preprocessed session files
     session_files = sorted(preproc_root.glob("*/*_preproc.parquet"))
@@ -111,7 +118,6 @@ def main() -> int:
         print(f"[ERROR] No _preproc.parquet files found under {preproc_root}")
         return 1
 
-    # Output rows per subject: write one windows.parquet per subject
     subject_rows: dict[str, list[dict]] = {}
 
     for pq in session_files:
@@ -133,7 +139,7 @@ def main() -> int:
         df = ensure_timesecs(df, subject_id, session_name)
         df = clean_event_column(df, subject_id, session_name)
 
-        # Ensure bad flag exists
+        # Ensure bad flag exists (treated as per-sample mask: True = bad sample)
         if "IsBadWindow" not in df.columns:
             df["IsBadWindow"] = False
 
@@ -159,10 +165,10 @@ def main() -> int:
             continue
 
         # Pre-grab arrays for speed
-        event_arr = df["Event"].to_numpy(dtype=np.int32, copy=False)          # safe ints, no NaNs
-        bad_arr = df["IsBadWindow"].astype(float).to_numpy(copy=False)        # 0/1
+        event_arr = df["Event"].to_numpy(dtype=np.int32, copy=False)            # safe ints, no NaNs
+        bad_arr = df["IsBadWindow"].astype(float).to_numpy(copy=False)          # 0/1 mask
         time_arr = df["TimeSecs"].to_numpy(dtype=np.float64, copy=False)
-        sig_arr = df[signal_cols].to_numpy(dtype=np.float32, copy=False)      # shape: (N, C)
+        sig_arr = df[signal_cols].to_numpy(dtype=np.float32, copy=False)        # shape: (N, C)
 
         for start in range(0, N - win_len_samples + 1, step_samples):
             end = start + win_len_samples
@@ -171,13 +177,15 @@ def main() -> int:
 
             # Label distribution within window
             uniq, cnts = np.unique(labels, return_counts=True)
+            if len(uniq) == 0:
+                continue
+
             top_i = int(np.argmax(cnts))
             top_label = int(uniq[top_i])
             frac = float(cnts[top_i] / win_len_samples)
 
-            # Transition rule: keep only if top label fraction >= keep_frac (e.g., 0.80)
-            if frac < keep_frac:
-                continue
+            # ✅ KEEP transition windows, but flag them
+            is_transition = frac < keep_frac
 
             # Bad window fraction
             bad_frac = float(bad_arr[start:end].mean())
@@ -204,15 +212,26 @@ def main() -> int:
                 "EndIdx": end,
                 "StartTime": start_time,
                 "EndTime": end_time,
+
+                # Label info
                 "EventLabel": top_label,
                 "LabelFrac": frac,
+                "IsTransition": bool(is_transition),
+                "purity_threshold": float(keep_frac),
+
+                # Quality info
                 "BadSampleFrac": bad_frac,
                 "IsBadWindow": bool(is_bad_window),
+
+                # Storage pointers
                 "raw_data_pointer": str(win_path),
                 "channels": ",".join(signal_cols),
+
+                # Window config
                 "window_len_s": float(args.window_len),
                 "step_s": float(args.step),
-                "transition_keep_frac": keep_frac,
+                "transition_keep_frac": float(keep_frac),
+
                 "created_utc": utc_now(),
             }
 
@@ -227,9 +246,13 @@ def main() -> int:
         out_file = out_subj_dir / "windows.parquet"
         out_table.to_parquet(out_file, index=False)
 
-        print(f"[OK] Saved {out_file} ({len(out_table)} windows)")
+        # Helpful counts
+        n_total = len(out_table)
+        n_trans = int(out_table["IsTransition"].sum()) if "IsTransition" in out_table.columns else 0
+        print(f"[OK] Saved {out_file} ({n_total} windows; transitions={n_trans})")
 
     print("\nDone windowing.")
+    print("Reminder for modeling: filter to IsTransition==False (and usually IsBadWindow==False).")
     return 0
 
 
