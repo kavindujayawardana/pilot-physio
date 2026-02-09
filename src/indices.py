@@ -1,210 +1,247 @@
 #!/usr/bin/env python3
-"""
-src/indices.py — Step 8: Anxiety indices (SAI/CAI)
-
-Reads:
-  features/<subject>/features.parquet
-
-Writes:
-  features/<subject>/features_with_indices.parquet
-  features/indices_spec.json  (if missing; created once)
-
-Key rules:
-- Normalization is PER SUBJECT.
-- Normalization stats are computed ONLY from benchmark sessions (CA, DA, SS).
-- LOFT is excluded from stats to avoid leakage.
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any
 
 import numpy as np
 import pandas as pd
-
-EPS = 1e-12
-BENCHMARK_TYPES = {"CA", "DA", "SS"}  # exclude LOFT
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def zscore_with_stats(x: pd.Series, mu: float, sd: float) -> pd.Series:
-    return (x - mu) / (sd + EPS)
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def mean_std_from_benchmark(df: pd.DataFrame, col: str) -> Tuple[float, float]:
+def write_json(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def safe_std(x: pd.Series, eps: float = 1e-8) -> float:
+    sd = float(x.std(ddof=0))
+    if not np.isfinite(sd) or sd < eps:
+        return eps
+    return sd
+
+
+def zscore(series: pd.Series, mu: float, sd: float) -> pd.Series:
+    sd = sd if (sd is not None and sd > 0) else 1.0
+    out = (series.astype(float) - float(mu)) / float(sd)
+    # keep NaNs if series has NaNs; don’t fill here
+    return out
+
+
+def benchmark_mask(df: pd.DataFrame) -> pd.Series:
     """
-    Compute mean and std using benchmark rows only (CA/DA/SS).
-    Returns (mu, sd). If sd=0 or not enough data, sd becomes 1 to avoid blowups.
+    Benchmark-only mask:
+    - BenchmarkTask == True (preferred)
+      OR SessionType in {CA,DA,SS} if BenchmarkTask missing.
+    - Exclude transitions from stats if IsTransition exists (best practice).
+    - Exclude bad windows from stats if IsBadWindow exists (best practice).
     """
-    bench = df[df["SessionType"].isin(BENCHMARK_TYPES)]
-    s = pd.to_numeric(bench[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    if len(s) < 5:
-        # Not enough values -> fallback (avoid crashing)
-        return float(s.mean()) if len(s) else 0.0, 1.0
-    mu = float(s.mean())
-    sd = float(s.std(ddof=1))
-    if not np.isfinite(sd) or sd < EPS:
-        sd = 1.0
-    return mu, sd
+    if "BenchmarkTask" in df.columns:
+        m = df["BenchmarkTask"].astype(bool)
+    elif "SessionType" in df.columns:
+        m = df["SessionType"].astype(str).str.upper().isin(["CA", "DA", "SS"])
+    else:
+        # if we have no clue, treat all as benchmark (not ideal, but avoids crash)
+        m = pd.Series(True, index=df.index)
+
+    if "IsTransition" in df.columns:
+        m = m & (~df["IsTransition"].astype(bool))
+
+    if "IsBadWindow" in df.columns:
+        m = m & (~df["IsBadWindow"].astype(bool))
+
+    return m
 
 
-def ensure_indices_spec(out_root: Path) -> None:
-    spec_path = out_root / "indices_spec.json"
-    if spec_path.exists():
-        return
-
-    spec = {
-        "version": "1.0",
-        "created_utc": utc_now(),
-        "normalization": {
-            "scope": "per_subject",
-            "stats_source": "benchmark_only",
-            "benchmark_session_types": sorted(list(BENCHMARK_TYPES)),
-            "exclude_session_types": ["LOFT"],
-            "zscore": "z = (x - mu_subject) / (sd_subject + 1e-12)",
-            "index_standardization": "Final indices are z-scored again using benchmark windows only"
-        },
-        "indices": {
-            "SAI": {
-                "name": "Somatic Anxiety Index",
-                "definition": "SAI_raw = z(GSR_phasic_rate) + z(HR_mean) + z(resp_irregularity); SAI = z(SAI_raw)",
-                "components": [
-                    {"feature": "GSR_phasic_rate", "source": "SCR_count_10s / 10.0", "weight": 1.0},
-                    {"feature": "HR_mean", "source": "HR_mean", "weight": 1.0},
-                    {"feature": "respiration_irregularity", "source": "R_std (proxy)", "weight": 1.0}
-                ],
-                "notes": [
-                    "GSR phasic rate computed from SCR_count_10s converted to peaks per second.",
-                    "Respiration irregularity approximated using R_std due to absence of breath-interval variability features."
-                ]
-            },
-            "CAI": {
-                "name": "Cognitive Anxiety Index",
-                "definition": "CAI_raw = z(frontal_theta) - z(frontal_alpha); CAI = z(CAI_raw)",
-                "components": [
-                    {"feature": "frontal_theta", "source": "mean of FP1/FP2/F3/F4/Fz theta band power", "weight": 1.0, "sign": "+"},
-                    {"feature": "frontal_alpha", "source": "frontal_mean_alpha", "weight": 1.0, "sign": "-"}
-                ]
-            }
-        }
-    }
-
-    spec_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(spec_path, "w", encoding="utf-8") as f:
-        json.dump(spec, f, indent=2)
+@dataclass
+class IndexSpec:
+    name: str
+    description: str
+    features: list[str]
+    combination: str
 
 
-def compute_indices_for_subject(features_path: Path, out_subject_dir: Path) -> None:
-    df = pd.read_parquet(features_path)
+def load_indices_spec(spec_path: Path) -> dict[str, IndexSpec]:
+    spec_raw = read_json(spec_path)
+    out: dict[str, IndexSpec] = {}
+    for name, cfg in spec_raw.items():
+        out[name] = IndexSpec(
+            name=name,
+            description=str(cfg.get("description", "")),
+            features=list(cfg.get("features", [])),
+            combination=str(cfg.get("combination", "")),
+        )
+    return out
 
-    # Basic safety checks
-    required = {"SessionType", "HR_mean", "SCR_count_10s", "R_std", "frontal_mean_alpha"}
-    missing = [c for c in required if c not in df.columns]
+
+def compute_subject_feature_norms(df: pd.DataFrame, feats: list[str]) -> dict[str, dict[str, float]]:
+    """
+    Compute per-feature mean/std from benchmark rows only.
+    """
+    m = benchmark_mask(df)
+    ref = df.loc[m]
+
+    norms: dict[str, dict[str, float]] = {}
+    for f in feats:
+        if f not in df.columns:
+            continue
+        s = pd.to_numeric(ref[f], errors="coerce")
+        mu = float(s.mean(skipna=True))
+        sd = safe_std(s.dropna())
+        norms[f] = {"mean": mu, "std": sd}
+    return norms
+
+
+def compute_indices(df: pd.DataFrame, spec: dict[str, IndexSpec]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Returns:
+      - df with SAI / CAI added
+      - stats dict for transparency (benchmark-only means/stds)
+    """
+    # collect all required feature names
+    required_feats: list[str] = []
+    for idx in spec.values():
+        for f in idx.features:
+            if f not in required_feats:
+                required_feats.append(f)
+
+    # sanity check required columns exist
+    missing = [f for f in required_feats if f not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns in {features_path}: {missing}")
+        raise ValueError(
+            "Missing required feature columns for indices: "
+            + ", ".join(missing)
+            + "\n(Ensure Step 7 features extraction produced these columns.)"
+        )
 
-    # --- Build component features ---
-    # GSR phasic rate: SCR peaks per second over 10s
-    df["GSR_phasic_rate"] = pd.to_numeric(df["SCR_count_10s"], errors="coerce") / 10.0
+    # compute per-subject benchmark-only norms for those features
+    feat_norms = compute_subject_feature_norms(df, required_feats)
 
-    # Resp irregularity proxy
-    df["respiration_irregularity"] = pd.to_numeric(df["R_std"], errors="coerce")
+    # z-score each required feature for all rows (using benchmark-only stats)
+    z_cols: dict[str, pd.Series] = {}
+    for f in required_feats:
+        mu = feat_norms[f]["mean"]
+        sd = feat_norms[f]["std"]
+        z_cols[f] = zscore(pd.to_numeric(df[f], errors="coerce"), mu, sd)
 
-    # Frontal theta (compute from available EEG theta columns)
-    frontal_theta_cols = ["EEG_FP1_theta", "EEG_FP2_theta", "EEG_F3_theta", "EEG_F4_theta", "EEG_Fz_theta"]
-    for c in frontal_theta_cols:
-        if c not in df.columns:
-            raise ValueError(f"Missing frontal theta column: {c} in {features_path}")
+    # build raw indices
+    out = df.copy()
 
-    df["frontal_theta"] = df[frontal_theta_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+    # SAI: z-score sum of listed features
+    if "SAI" in spec:
+        sai_feats = spec["SAI"].features
+        sai_raw = None
+        for f in sai_feats:
+            sai_raw = z_cols[f] if sai_raw is None else (sai_raw + z_cols[f])
+        out["SAI_raw"] = sai_raw
 
-    # Frontal alpha is already computed
-    df["frontal_alpha"] = pd.to_numeric(df["frontal_mean_alpha"], errors="coerce")
+    # CAI: z(theta_beta_ratio) - z(frontal_mean_alpha)
+    if "CAI" in spec:
+        cai_feats = spec["CAI"].features
+        if len(cai_feats) != 2:
+            raise ValueError("CAI spec must contain exactly 2 features: [theta_beta_ratio, frontal_mean_alpha]")
+        out["CAI_raw"] = z_cols[cai_feats[0]] - z_cols[cai_feats[1]]
 
-    # --- Compute per-subject benchmark stats for each component ---
-    stats: Dict[str, Dict[str, float]] = {}
-    for col in ["GSR_phasic_rate", "HR_mean", "respiration_irregularity", "frontal_theta", "frontal_alpha"]:
-        mu, sd = mean_std_from_benchmark(df, col)
-        stats[col] = {"mean": mu, "std": sd}
+    # optionally standardize index itself to mean 0, std 1 on benchmark rows
+    m = benchmark_mask(out)
 
-    # --- z-score components using benchmark μ/σ ---
-    df["z_GSR_phasic_rate"] = zscore_with_stats(df["GSR_phasic_rate"], stats["GSR_phasic_rate"]["mean"], stats["GSR_phasic_rate"]["std"])
-    df["z_HR_mean"] = zscore_with_stats(df["HR_mean"], stats["HR_mean"]["mean"], stats["HR_mean"]["std"])
-    df["z_resp_irregularity"] = zscore_with_stats(df["respiration_irregularity"], stats["respiration_irregularity"]["mean"], stats["respiration_irregularity"]["std"])
-
-    df["z_frontal_theta"] = zscore_with_stats(df["frontal_theta"], stats["frontal_theta"]["mean"], stats["frontal_theta"]["std"])
-    df["z_frontal_alpha"] = zscore_with_stats(df["frontal_alpha"], stats["frontal_alpha"]["mean"], stats["frontal_alpha"]["std"])
-
-    # --- Build raw indices ---
-    df["SAI_raw"] = df["z_GSR_phasic_rate"] + df["z_HR_mean"] + df["z_resp_irregularity"]
-    df["CAI_raw"] = df["z_frontal_theta"] - df["z_frontal_alpha"]
-
-    # --- Standardize indices again using benchmark windows only ---
-    sai_mu, sai_sd = mean_std_from_benchmark(df.assign(SAI_raw=df["SAI_raw"]), "SAI_raw")
-    cai_mu, cai_sd = mean_std_from_benchmark(df.assign(CAI_raw=df["CAI_raw"]), "CAI_raw")
-
-    df["SAI"] = zscore_with_stats(df["SAI_raw"], sai_mu, sai_sd)
-    df["CAI"] = zscore_with_stats(df["CAI_raw"], cai_mu, cai_sd)
-
-    # Validity flags (useful later)
-    df["SAI_valid"] = df[["GSR_phasic_rate", "HR_mean", "respiration_irregularity"]].notna().all(axis=1)
-    df["CAI_valid"] = df[["frontal_theta", "frontal_alpha"]].notna().all(axis=1)
-
-    # Save per-subject stats for transparency (optional but very useful)
-    stats_payload = {
-        "subject": str(df["SubjectID"].iloc[0]) if "SubjectID" in df.columns and len(df) else out_subject_dir.name,
+    idx_stats: dict[str, Any] = {
         "created_utc": utc_now(),
-        "benchmark_session_types": sorted(list(BENCHMARK_TYPES)),
-        "component_stats": stats,
-        "index_stats": {
-            "SAI_raw": {"mean": sai_mu, "std": sai_sd},
-            "CAI_raw": {"mean": cai_mu, "std": cai_sd}
-        }
+        "benchmark_filter": {
+            "used_BenchmarkTask_if_present": "BenchmarkTask" in out.columns,
+            "excluded_IsTransition_if_present": "IsTransition" in out.columns,
+            "excluded_IsBadWindow_if_present": "IsBadWindow" in out.columns,
+        },
+        "feature_norms_benchmark_only": feat_norms,
+        "index_norms_benchmark_only": {},
     }
-    out_subject_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_subject_dir / "indices_stats.json", "w", encoding="utf-8") as f:
-        json.dump(stats_payload, f, indent=2)
 
-    out_path = out_subject_dir / "features_with_indices.parquet"
-    df.to_parquet(out_path, index=False)
-    print(f"[OK] Saved {out_path} ({len(df)} rows, {df.shape[1]} cols)")
+    for idx_name in ["SAI", "CAI"]:
+        raw_col = f"{idx_name}_raw"
+        if raw_col not in out.columns:
+            continue
+
+        ref = pd.to_numeric(out.loc[m, raw_col], errors="coerce")
+        mu = float(ref.mean(skipna=True))
+        sd = safe_std(ref.dropna())
+
+        idx_stats["index_norms_benchmark_only"][idx_name] = {"mean": mu, "std": sd}
+
+        out[idx_name] = zscore(pd.to_numeric(out[raw_col], errors="coerce"), mu, sd)
+
+    return out, idx_stats
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--features", required=True, help="Path to features/ root (contains <subject>/features.parquet)")
-    ap.add_argument("--out", required=True, help="Output root (usually ./features)")
+    ap = argparse.ArgumentParser(description="Compute SAI/CAI anxiety indices from extracted features (benchmark-only norms).")
+    ap.add_argument("--features", required=True, help="Path to features/ (contains <subject>/features.parquet)")
+    ap.add_argument("--spec", default="features/indices_spec.json", help="Path to indices_spec.json")
+    ap.add_argument("--out", default=None, help="Output root. Default: same as --features")
+    ap.add_argument(
+        "--write-stats",
+        action="store_true",
+        help="Write per-subject indices_stats.json next to outputs (recommended, but do NOT commit).",
+    )
+    ap.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite features.parquet with indices columns (NOT recommended). Default writes features_with_indices.parquet",
+    )
     args = ap.parse_args()
 
     features_root = Path(args.features).resolve()
-    out_root = Path(args.out).resolve()
-    out_root.mkdir(parents=True, exist_ok=True)
+    spec_path = Path(args.spec).resolve()
+    out_root = Path(args.out).resolve() if args.out else features_root
 
-    ensure_indices_spec(out_root)
+    if not spec_path.exists():
+        print(f"[ERROR] Spec file not found: {spec_path}")
+        return 1
 
-    # Find all per-subject features.parquet
-    files = sorted(features_root.rglob("features.parquet"))
-    if not files:
+    spec = load_indices_spec(spec_path)
+
+    # find subject feature files
+    feat_files = sorted(features_root.glob("*/features.parquet"))
+    if not feat_files:
         print(f"[ERROR] No features.parquet found under {features_root}")
         return 1
 
-    for fp in files:
-        # subject directory is parent name
-        subject_dir = fp.parent.name
-        out_subject_dir = out_root / subject_dir
-        try:
-            compute_indices_for_subject(fp, out_subject_dir)
-        except Exception as e:
-            print(f"[ERROR] Failed {fp}: {type(e).__name__}: {e}")
+    for fp in feat_files:
+        subject_id = fp.parent.name
+        df = pd.read_parquet(fp)
+
+        # compute
+        out_df, stats = compute_indices(df, spec)
+
+        subj_out_dir = out_root / subject_id
+        subj_out_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.overwrite:
+            out_path = subj_out_dir / "features.parquet"
+        else:
+            out_path = subj_out_dir / "features_with_indices.parquet"
+
+        out_df.to_parquet(out_path, index=False)
+
+        if args.write_stats:
+            stats_path = subj_out_dir / "indices_stats.json"
+            write_json(stats_path, stats)
+
+        print(f"[OK] {subject_id}: wrote {out_path.name} (rows={len(out_df)}, cols={out_df.shape[1]})")
 
     print("\nDone indices.")
+    if not args.overwrite:
+        print("Tip for modeling: use features_with_indices.parquet and filter out transitions (IsTransition==False) + bad windows if needed.")
     return 0
 
 
