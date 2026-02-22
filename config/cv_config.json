@@ -1,0 +1,28 @@
+{
+  "task": "multiclass_classification",
+  "classes": [0, 1, 2, 5],
+  "group_column": "SubjectID",
+  "outer_cv": {
+    "name": "LeaveOneGroupOut",
+    "purpose": "final_generalization_to_unseen_subject"
+  },
+  "inner_cv": {
+    "name": "GroupKFold",
+    "n_splits": 5,
+    "purpose": "hyperparameter_tuning_without_subject_leakage"
+  },
+  "imbalance_handling": {
+    "method": "class_weight",
+    "rule": "balanced",
+    "compute_from": "training_fold_only"
+  },
+  "metrics": {
+    "primary": ["f1_macro", "balanced_accuracy"],
+    "secondary": ["recall_macro", "precision_macro"],
+    "report_also": ["per_class_recall", "confusion_matrix_normalized"]
+  },
+  "preprocessing": {
+    "standardize_for": ["logistic_regression", "svm_if_used"],
+    "fit_on": "training_fold_only"
+  }
+}
