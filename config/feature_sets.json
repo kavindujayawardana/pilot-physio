@@ -1,0 +1,46 @@
+{
+  "dataset_A_theory": [
+    "frontal_mean_alpha",
+    "frontal_asymmetry_alpha",
+    "theta_beta_ratio",
+    "HR_mean",
+    "HR_slope",
+    "HRV_RMSSD_30s",
+    "HRV_SDNN_30s",
+    "GSR_mean",
+    "GSR_std",
+    "GSR_peak_count",
+    "breathing_rate_10s_bpm",
+    "SAI",
+    "CAI"
+  ],
+  "dataset_B_all_policy": {
+    "source_file_preference": "features_with_indices.parquet",
+    "include": "all numeric columns",
+    "exclude_columns_exact": [
+      "WindowID",
+      "SubjectID",
+      "CrewID",
+      "SessionName",
+      "SessionType",
+      "BenchmarkTask",
+      "StartIdx",
+      "EndIdx",
+      "StartTime",
+      "EndTime",
+      "EventLabel",
+      "LabelFrac",
+      "BadSampleFrac",
+      "IsBadWindow",
+      "IsTransition",
+      "raw_data_pointer",
+      "channels",
+      "window_len_s",
+      "step_s",
+      "transition_keep_frac",
+      "created_utc",
+      "_source_file"
+    ]
+  },
+  "dataset_C_select": []
+}
