@@ -42,5 +42,22 @@
       "_source_file"
     ]
   },
-  "dataset_C_select": []
+  "dataset_C_select": [],
+  "SELECT_FEATURES": [
+    "EEG_F7_delta",
+    "EEG_FP1_delta",
+    "EEG_O1_delta",
+    "EEG_POz_delta",
+    "EEG_F8_delta",
+    "EEG_FP1_theta",
+    "EEG_O2_delta",
+    "EEG_O2_theta",
+    "EEG_Fz_delta",
+    "GSR_peak_count_roll5s_mean",
+    "EEG_F3_beta",
+    "EEG_T4_beta",
+    "GSR_mean_lag1s",
+    "R_std_roll10s_mean",
+    "EEG_F4_beta"
+  ]
 }
