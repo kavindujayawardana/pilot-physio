@@ -1,415 +1,476 @@
 #!/usr/bin/env python3
 """
-Hyperparameter tuning (per model) with imbalance-aware GroupKFold CV.
+tune_models.py
 
-Fixes:
-- XGBoost requires class labels to be contiguous 0..K-1.
-  We encode y -> y_enc and save mapping to decode later.
+Hyperparameter tuning (GroupKFold) for multiple models over a chosen feature set.
 
-Usage:
-  python notebooks/tune_models.py --feature-set theory
-  python notebooks/tune_models.py --feature-set all
+Feature sets supported:
+  - theory  -> results/model_ready/X_theory.parquet
+  - all     -> results/model_ready/X_all.parquet
+  - select  -> results/model_ready/X_select.parquet
 
-Inputs:
-  results/model_ready/X_theory.parquet
-  results/model_ready/X_all.parquet
-  results/model_ready/y.parquet               (must contain column EventLabel)
-  results/model_ready/groups.parquet          (must contain column SubjectID)
+Targets/groups expected in:
+  - results/model_ready/y.parquet        (column: EventLabel)
+  - results/model_ready/groups.parquet   (column: SubjectID)
 
-Outputs:
+Outputs (per feature set) written to:
   results/tuning/<feature_set>/
-    - label_mapping.json
-    - best_models.json
     - leaderboard.csv
-    - cv_results_<model>.csv
+    - best_models.json
+    - label_mapping.json
+
+Notes:
+- Handles class imbalance via class weights:
+    * LogisticRegression: class_weight='balanced'
+    * RandomForest: class_weight='balanced'
+    * XGBoost: sample_weight using sklearn's compute_sample_weight
+    * CatBoost (optional): class_weights list (aligned to encoded classes)
+- XGBoost expects classes 0..K-1, so we label-encode y for XGB (and CatBoost for consistency).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import GroupKFold, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import make_scorer, f1_score, balanced_accuracy_score
-from sklearn.utils.class_weight import compute_class_weight
-
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.metrics import make_scorer, f1_score, balanced_accuracy_score
 
-_HAS_XGB = True
+# Optional models
 try:
     from xgboost import XGBClassifier
+    _HAS_XGB = True
 except Exception:
     _HAS_XGB = False
 
-_HAS_CAT = True
 try:
     from catboost import CatBoostClassifier
+    _HAS_CATBOOST = True
 except Exception:
-    _HAS_CAT = False
+    _HAS_CATBOOST = False
 
 
 # -----------------------------
-# Utilities
+# Scoring
 # -----------------------------
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+macro_f1_scorer = make_scorer(f1_score, average="macro")
+bal_acc_scorer = make_scorer(balanced_accuracy_score)
+
+SCORERS = {
+    "macro_f1": macro_f1_scorer,
+    "bal_acc": bal_acc_scorer,
+}
 
 
-def ensure_dir(p: Path) -> None:
+# -----------------------------
+# Helpers
+# -----------------------------
+def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def read_parquet_series(path: Path, col: str) -> pd.Series:
-    df = pd.read_parquet(path)
-    if col not in df.columns:
-        raise ValueError(f"Expected column '{col}' in {path}, got {list(df.columns)}")
-    return df[col]
+def load_model_ready(model_ready: Path, feature_set: str) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """Load X, y, groups for a given feature_set."""
+    if feature_set == "theory":
+        x_path = model_ready / "X_theory.parquet"
+    elif feature_set == "all":
+        x_path = model_ready / "X_all.parquet"
+    elif feature_set == "select":
+        x_path = model_ready / "X_select.parquet"
+    else:
+        raise ValueError(f"Unknown feature_set: {feature_set}")
 
+    y_path = model_ready / "y.parquet"
+    g_path = model_ready / "groups.parquet"
 
-def load_model_ready(model_ready_dir: Path, feature_set: str) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    feature_set = feature_set.lower().strip()
-    if feature_set not in {"theory", "all"}:
-        raise ValueError("--feature-set must be one of: theory, all")
-
-    x_path = model_ready_dir / ("X_theory.parquet" if feature_set == "theory" else "X_all.parquet")
-    y_path = model_ready_dir / "y.parquet"
-    g_path = model_ready_dir / "groups.parquet"
+    if not x_path.exists():
+        raise FileNotFoundError(f"Missing X file: {x_path}")
+    if not y_path.exists():
+        raise FileNotFoundError(f"Missing y file: {y_path}")
+    if not g_path.exists():
+        raise FileNotFoundError(f"Missing groups file: {g_path}")
 
     X = pd.read_parquet(x_path)
-    y = read_parquet_series(y_path, "EventLabel")
-    groups = read_parquet_series(g_path, "SubjectID")
+    y_df = pd.read_parquet(y_path)
+    g_df = pd.read_parquet(g_path)
 
-    if not (len(X) == len(y) == len(groups)):
-        raise ValueError(f"Shape mismatch: X={X.shape}, y={y.shape}, groups={groups.shape}")
+    if "EventLabel" not in y_df.columns:
+        raise ValueError("y.parquet must contain column 'EventLabel'")
+    if "SubjectID" not in g_df.columns:
+        raise ValueError("groups.parquet must contain column 'SubjectID'")
+
+    y = y_df["EventLabel"].to_numpy()
+    groups = g_df["SubjectID"].to_numpy()
+
+    if len(X) != len(y) or len(y) != len(groups):
+        raise ValueError(
+            f"Row mismatch: X={len(X)}, y={len(y)}, groups={len(groups)}"
+        )
 
     return X, y, groups
 
 
-def compute_class_weights(y: pd.Series) -> dict[int, float]:
-    classes = np.array(sorted(pd.unique(y)))
-    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y.to_numpy())
-    return {int(c): float(w) for c, w in zip(classes, weights)}
+def summarize_counts(y: np.ndarray) -> Dict[Any, int]:
+    vals, cnts = np.unique(y, return_counts=True)
+    return {int(v) if np.issubdtype(type(v), np.integer) or str(v).isdigit() else v: int(c) for v, c in zip(vals, cnts)}
 
 
-def make_sample_weights(y: pd.Series, cw: dict[int, float]) -> np.ndarray:
-    return np.asarray([cw[int(v)] for v in y.to_numpy()], dtype=float)
-
-
-def macro_f1():
-    return make_scorer(f1_score, average="macro")
-
-
-def bal_acc():
-    return make_scorer(balanced_accuracy_score)
-
-
-def encode_labels(y: pd.Series) -> tuple[pd.Series, dict[int, int], dict[int, int]]:
+def build_label_mapping(y_orig: np.ndarray) -> Tuple[np.ndarray, Dict[int, int], Dict[int, int]]:
     """
-    Map original labels (e.g., 0,1,2,5) -> contiguous (0..K-1).
-    Returns (y_enc, orig_to_enc, enc_to_orig)
+    Encode labels to 0..K-1 and return:
+      y_enc,
+      orig_to_enc,
+      enc_to_orig
     """
-    orig = sorted(pd.unique(y))
-    orig_to_enc = {int(o): int(i) for i, o in enumerate(orig)}
-    enc_to_orig = {int(i): int(o) for i, o in enumerate(orig)}
-    y_enc = y.map(orig_to_enc).astype(int)
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y_orig)
+
+    # LabelEncoder stores classes_ sorted; map originals -> encoded indices
+    classes = le.classes_
+    orig_to_enc = {int(orig): int(enc) for enc, orig in enumerate(classes)}
+    enc_to_orig = {int(enc): int(orig) for enc, orig in enumerate(classes)}
     return y_enc, orig_to_enc, enc_to_orig
 
 
-# -----------------------------
-# Model specs
-# -----------------------------
-def build_model_specs(
-    y_orig: pd.Series,
-    y_enc: pd.Series,
-    seed: int,
-) -> list[dict]:
+@dataclass
+class ModelSpec:
+    name: str
+    estimator: Any
+    param_distributions: Dict[str, Any]
+    needs_scaling: bool
+    use_encoded_y: bool  # True for models that require 0..K-1
+
+
+def build_models_and_spaces(random_state: int = 42) -> List[ModelSpec]:
     """
-    Each spec:
-      {
-        "name": str,
-        "estimator": estimator,
-        "param_distributions": dict,
-        "y_for_fit": "orig"|"enc",
-        "fit_params_fn": callable|None
-      }
+    Define models + random search spaces.
+    Keep spaces reasonably small for MSc timeline.
     """
-    cw_orig = compute_class_weights(y_orig)
-    cw_enc = compute_class_weights(y_enc)
+    specs: List[ModelSpec] = []
 
-    specs: list[dict] = []
-
-    # Logistic Regression (use original y; sklearn handles non-contiguous classes)
-    lr = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(
-            max_iter=5000,
-            class_weight=cw_orig,
-            random_state=seed,
-        ))
-    ])
-    lr_space = {
-        "clf__C": np.logspace(-3, 3, 20),
-        "clf__solver": ["lbfgs"],
-        # remove penalty from search to avoid sklearn warning spam
-    }
-    specs.append({
-        "name": "logreg",
-        "estimator": lr,
-        "param_distributions": lr_space,
-        "y_for_fit": "orig",
-        "fit_params_fn": None,
-    })
-
-    # Random Forest (use original y)
-    rf = RandomForestClassifier(
-        random_state=seed,
-        n_jobs=-1,
-        class_weight=cw_orig,
+    # Logistic Regression (multinomial by default if solver supports it)
+    # class_weight='balanced' for imbalance
+    logreg = LogisticRegression(
+        max_iter=5000,
+        class_weight="balanced",
+        solver="lbfgs",
+        n_jobs=None,  # lbfgs ignores n_jobs; keep None for compatibility
+        random_state=random_state,
     )
-    rf_space = {
-        "n_estimators": [200, 400, 600, 800, 1000],
-        "max_depth": [None, 6, 10, 14, 18, 24],
-        "min_samples_split": [2, 5, 10, 20],
-        "min_samples_leaf": [1, 2, 4, 8],
-        "max_features": ["sqrt", "log2", 0.3, 0.5, 0.8],
-    }
-    specs.append({
-        "name": "rf",
-        "estimator": rf,
-        "param_distributions": rf_space,
-        "y_for_fit": "orig",
-        "fit_params_fn": None,
-    })
+    # NOTE: sklearn 1.8+ deprecates setting 'penalty' explicitly for non-elasticnet;
+    # we tune only C and solver here to avoid warnings.
+    specs.append(
+        ModelSpec(
+            name="logreg",
+            estimator=logreg,
+            param_distributions={
+                "clf__C": np.logspace(-4, 2, 20),
+                # if you want to try saga for potential l1/elasticnet later:
+                # "clf__solver": ["lbfgs", "saga"]
+                "clf__solver": ["lbfgs"],
+            },
+            needs_scaling=True,
+            use_encoded_y=False,
+        )
+    )
 
-    # XGBoost (must use encoded y)
+    # Random Forest
+    rf = RandomForestClassifier(
+        random_state=random_state,
+        class_weight="balanced",
+        n_jobs=-1,
+    )
+    specs.append(
+        ModelSpec(
+            name="rf",
+            estimator=rf,
+            param_distributions={
+                "clf__n_estimators": [200, 400, 800],
+                "clf__max_depth": [None, 6, 10, 14, 18],
+                "clf__max_features": [0.2, 0.3, 0.5, "sqrt"],
+                "clf__min_samples_split": [2, 5, 10],
+                "clf__min_samples_leaf": [1, 2, 4, 8],
+            },
+            needs_scaling=False,
+            use_encoded_y=False,
+        )
+    )
+
+    # XGBoost (optional)
     if _HAS_XGB:
         xgb = XGBClassifier(
             objective="multi:softprob",
-            eval_metric="mlogloss",
             tree_method="hist",
-            random_state=seed,
-            n_estimators=500,
-            learning_rate=0.05,
+            eval_metric="mlogloss",
+            random_state=random_state,
+            n_jobs=-1,
         )
-        xgb_space = {
-            "max_depth": [3, 4, 5, 6, 8, 10],
-            "learning_rate": [0.01, 0.03, 0.05, 0.08, 0.1],
-            "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
-            "min_child_weight": [1, 2, 5, 10],
-            "gamma": [0, 0.05, 0.1, 0.2],
-            "reg_lambda": [0.5, 1.0, 2.0, 5.0],
-        }
-
-        def xgb_fit_params() -> dict:
-            sw = make_sample_weights(y_enc, cw_enc)
-            return {"sample_weight": sw}
-
-        specs.append({
-            "name": "xgb",
-            "estimator": xgb,
-            "param_distributions": xgb_space,
-            "y_for_fit": "enc",
-            "fit_params_fn": xgb_fit_params,
-        })
+        specs.append(
+            ModelSpec(
+                name="xgb",
+                estimator=xgb,
+                param_distributions={
+                    "clf__max_depth": [2, 3, 4, 5],
+                    "clf__learning_rate": [0.01, 0.03, 0.05, 0.1],
+                    "clf__subsample": [0.6, 0.8, 0.9, 1.0],
+                    "clf__colsample_bytree": [0.5, 0.6, 0.7, 0.8, 1.0],
+                    "clf__min_child_weight": [1, 2, 5, 10],
+                    "clf__gamma": [0.0, 0.05, 0.1, 0.2],
+                    "clf__reg_lambda": [0.5, 1.0, 2.0, 5.0],
+                    # n_estimators intentionally omitted (use low lr + defaults)
+                },
+                needs_scaling=False,
+                use_encoded_y=True,  # must be 0..K-1
+            )
+        )
     else:
         print("[WARN] xgboost not installed; skipping XGBClassifier.")
 
     # CatBoost (optional)
-    if _HAS_CAT:
-        cat = CatBoostClassifier(
+    if _HAS_CATBOOST:
+        # We'll pass class_weights at fit-time (depends on label encoding).
+        cb = CatBoostClassifier(
             loss_function="MultiClass",
-            random_seed=seed,
+            random_seed=random_state,
             verbose=False,
         )
-        cat_space = {
-            "depth": [4, 6, 8, 10],
-            "learning_rate": [0.01, 0.03, 0.05, 0.1],
-            "l2_leaf_reg": [1, 3, 5, 7, 9],
-            "iterations": [300, 600, 900, 1200],
-        }
-
-        def cat_fit_params() -> dict:
-            # CatBoost expects class_weights ordered by class indices 0..K-1
-            classes = sorted(pd.unique(y_enc))
-            cw_list = [float(cw_enc[int(c)]) for c in classes]
-            return {"class_weights": cw_list}
-
-        specs.append({
-            "name": "catboost",
-            "estimator": cat,
-            "param_distributions": cat_space,
-            "y_for_fit": "enc",
-            "fit_params_fn": cat_fit_params,
-        })
+        specs.append(
+            ModelSpec(
+                name="catboost",
+                estimator=cb,
+                param_distributions={
+                    "clf__depth": [3, 4, 5, 6, 7],
+                    "clf__learning_rate": [0.01, 0.03, 0.05, 0.1],
+                    "clf__l2_leaf_reg": [1, 3, 5, 7, 10],
+                    "clf__iterations": [300, 600, 1000],
+                },
+                needs_scaling=False,
+                use_encoded_y=True,  # for consistent class_weights handling
+            )
+        )
     else:
         print("[WARN] catboost not installed; skipping CatBoostClassifier.")
 
     return specs
 
 
-# -----------------------------
-# Tuning runner
-# -----------------------------
-def run_tuning(
+def make_pipeline(spec: ModelSpec) -> Pipeline:
+    steps = []
+    if spec.needs_scaling:
+        steps.append(("scaler", StandardScaler()))
+    steps.append(("clf", spec.estimator))
+    return Pipeline(steps)
+
+
+def fit_params_for_model(
+    spec: ModelSpec,
+    y_used: np.ndarray,
+    y_enc: np.ndarray,
+    orig_to_enc: Dict[int, int],
+) -> Dict[str, Any]:
+    """
+    Return fit_params for RandomizedSearchCV.fit() depending on model.
+    We handle class imbalance primarily through:
+      - class_weight='balanced' inside logreg/rf
+      - sample_weight for xgb
+      - class_weights for catboost
+    """
+    fit_params: Dict[str, Any] = {}
+
+    if spec.name == "xgb":
+        # XGB expects encoded labels; supply per-sample weights for imbalance
+        w = compute_sample_weight(class_weight="balanced", y=y_enc)
+        fit_params["clf__sample_weight"] = w
+
+    if spec.name == "catboost":
+        # CatBoost supports class_weights as a list aligned to class indices 0..K-1
+        # Compute balanced weights from encoded y
+        classes, counts = np.unique(y_enc, return_counts=True)
+        n_classes = len(classes)
+        total = counts.sum()
+        # balanced weight: total/(n_classes*count_c)
+        cw = [float(total / (n_classes * c)) for c in counts]
+        # Ensure list length = n_classes and ordered by class index
+        # (LabelEncoder classes are 0..K-1 in order)
+        fit_params["clf__class_weights"] = cw
+
+    return fit_params
+
+
+def run_tuning_one(
     X: pd.DataFrame,
-    y_orig: pd.Series,
-    y_enc: pd.Series,
-    groups: pd.Series,
-    out_dir: Path,
-    seed: int,
+    y_orig: np.ndarray,
+    y_enc: np.ndarray,
+    groups: np.ndarray,
+    spec: ModelSpec,
     n_iter: int,
-    n_splits: int,
+    splits: int,
+    seed: int,
     n_jobs: int,
-    label_maps: dict,
-) -> None:
-    ensure_dir(out_dir)
+) -> Dict[str, Any]:
+    """
+    Tune a single model spec using GroupKFold and macro_f1 as refit metric.
+    Returns dict of best results for leaderboard + best params.
+    """
+    cv = GroupKFold(n_splits=splits)
+    pipe = make_pipeline(spec)
 
-    # Save mapping so later evaluation can decode XGB/CatBoost predictions back to original labels
-    (out_dir / "label_mapping.json").write_text(json.dumps(label_maps, indent=2), encoding="utf-8")
+    # Choose which y to use
+    if spec.use_encoded_y:
+        y_used = y_enc
+        y_for_fit_label = "enc"
+    else:
+        y_used = y_orig
+        y_for_fit_label = "orig"
 
-    cv = GroupKFold(n_splits=n_splits)
+    # Fit params (weights)
+    _, orig_to_enc, _ = build_label_mapping(y_orig)  # for signature; mapping stable
+    fit_params = fit_params_for_model(spec, y_used=y_used, y_enc=y_enc, orig_to_enc=orig_to_enc)
 
-    scoring = {
-        "macro_f1": macro_f1(),
-        "bal_acc": bal_acc(),
+    print(f"\n[TUNE] {spec.name}  y_for_fit={y_for_fit_label}  (n_iter={n_iter}, splits={splits})")
+
+    search = RandomizedSearchCV(
+        estimator=pipe,
+        param_distributions=spec.param_distributions,
+        n_iter=n_iter,
+        scoring=SCORERS,
+        refit="macro_f1",
+        cv=cv,
+        random_state=seed,
+        n_jobs=n_jobs,
+        verbose=1,
+        return_train_score=False,
+        error_score="raise",
+    )
+
+    search.fit(X, y_used, groups=groups, **fit_params)
+
+    best_macro_f1 = float(search.best_score_)
+    # Also report best balanced accuracy from the same best params
+    # Recompute via cv_results_ entry matching best_index_
+    best_idx = int(search.best_index_)
+    mean_bal_acc = float(search.cv_results_["mean_test_bal_acc"][best_idx])
+
+    best_params = search.best_params_
+
+    print(f"[BEST] {spec.name}: macro_f1={best_macro_f1:.4f}  bal_acc={mean_bal_acc:.4f}")
+    print(f"[BEST] params: {best_params}")
+
+    return {
+        "Model": spec.name,
+        "CV Macro F1": best_macro_f1,
+        "Balanced Acc": mean_bal_acc,
+        "Best Params": best_params,
     }
 
-    specs = build_model_specs(y_orig=y_orig, y_enc=y_enc, seed=seed)
 
-    leaderboard_rows = []
-    best_models = {
-        "created_utc": utc_now(),
-        "n_rows": int(len(X)),
-        "n_features": int(X.shape[1]),
-        "label_counts_orig": {int(k): int(v) for k, v in y_orig.value_counts().to_dict().items()},
-        "label_counts_enc": {int(k): int(v) for k, v in y_enc.value_counts().to_dict().items()},
-        "cv": "GroupKFold",
-        "n_splits": int(n_splits),
-        "refit_metric": "macro_f1",
-        "models": {},
-    }
-
-    for spec in specs:
-        name = spec["name"]
-        est = spec["estimator"]
-        space = spec["param_distributions"]
-
-        y_fit = y_orig if spec["y_for_fit"] == "orig" else y_enc
-
-        fit_params = {}
-        if spec["fit_params_fn"] is not None:
-            fit_params = spec["fit_params_fn"]()
-
-        print(f"\n[TUNE] {name}  y_for_fit={spec['y_for_fit']}  (n_iter={n_iter}, splits={n_splits})")
-
-        search = RandomizedSearchCV(
-            estimator=est,
-            param_distributions=space,
-            n_iter=min(n_iter, len(list(space.values())[0]) if name == "logreg" else n_iter),
-            scoring=scoring,
-            refit="macro_f1",
-            cv=cv,
-            n_jobs=n_jobs,
-            verbose=1,
-            random_state=seed,
-            return_train_score=False,
-            error_score="raise",  # fail fast so you can debug
-        )
-
-        search.fit(X, y_fit, groups=groups, **fit_params)
-
-        cv_res = pd.DataFrame(search.cv_results_)
-        cv_path = out_dir / f"cv_results_{name}.csv"
-        cv_res.to_csv(cv_path, index=False)
-
-        best_idx = int(search.best_index_)
-        best_macro = float(cv_res.loc[best_idx, "mean_test_macro_f1"])
-        best_bal = float(cv_res.loc[best_idx, "mean_test_bal_acc"])
-        best_params = search.best_params_
-
-        print(f"[BEST] {name}: macro_f1={best_macro:.4f}  bal_acc={best_bal:.4f}")
-        print(f"[BEST] params: {best_params}")
-
-        leaderboard_rows.append({
-            "model": name,
-            "y_for_fit": spec["y_for_fit"],
-            "best_macro_f1": best_macro,
-            "best_bal_acc": best_bal,
-            "best_params": json.dumps(best_params, default=str),
-        })
-
-        best_models["models"][name] = {
-            "y_for_fit": spec["y_for_fit"],
-            "best_macro_f1": best_macro,
-            "best_bal_acc": best_bal,
-            "best_params": best_params,
-            "cv_results_csv": str(cv_path),
-        }
-
-    leaderboard = pd.DataFrame(leaderboard_rows).sort_values("best_macro_f1", ascending=False)
+def save_outputs(out_dir: Path, leaderboard: pd.DataFrame, best_models: Dict[str, Any], label_mapping: Dict[str, Any]) -> None:
+    _ensure_dir(out_dir)
     leaderboard_path = out_dir / "leaderboard.csv"
-    leaderboard.to_csv(leaderboard_path, index=False)
+    best_models_path = out_dir / "best_models.json"
+    mapping_path = out_dir / "label_mapping.json"
 
-    best_json_path = out_dir / "best_models.json"
-    best_json_path.write_text(json.dumps(best_models, indent=2, default=str), encoding="utf-8")
+    leaderboard.to_csv(leaderboard_path, index=False)
+    best_models_path.write_text(json.dumps(best_models, indent=2, default=str))
+    mapping_path.write_text(json.dumps(label_mapping, indent=2))
 
     print(f"\n[OK] Saved: {leaderboard_path}")
-    print(f"[OK] Saved: {best_json_path}")
-    print(f"[OK] Saved: {out_dir / 'label_mapping.json'}")
+    print(f"[OK] Saved: {best_models_path}")
+    print(f"[OK] Saved: {mapping_path}")
 
 
 # -----------------------------
-# CLI
+# Main
 # -----------------------------
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--feature-set", required=True, choices=["theory", "all"])
-    ap.add_argument("--model-ready", default="results/model_ready")
-    ap.add_argument("--out", default="results/tuning")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--n-iter", type=int, default=25)
-    ap.add_argument("--splits", type=int, default=5)
-    ap.add_argument("--n-jobs", type=int, default=-1)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--feature-set",
+        choices=["theory", "all", "select"],
+        required=True,
+        help="Which feature set to tune on",
+    )
+    parser.add_argument(
+        "--model-ready",
+        type=str,
+        default="results/model_ready",
+        help="Path to model-ready parquet folder",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="results/tuning",
+        help="Output folder for tuning results",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-iter", type=int, default=25)
+    parser.add_argument("--splits", type=int, default=5)
+    parser.add_argument("--n-jobs", type=int, default=-1)
+    args = parser.parse_args()
 
-    model_ready_dir = Path(args.model_ready).resolve()
-    out_dir = Path(args.out).resolve() / args.feature_set
+    model_ready = Path(args.model_ready)
+    out_root = Path(args.out)
+    out_dir = out_root / args.feature_set
 
-    X, y_orig, groups = load_model_ready(model_ready_dir, args.feature_set)
-    y_enc, orig_to_enc, enc_to_orig = encode_labels(y_orig)
-
-    label_maps = {
-        "orig_to_enc": orig_to_enc,
-        "enc_to_orig": enc_to_orig,
-        "orig_labels_sorted": sorted(orig_to_enc.keys()),
-    }
+    X, y_orig, groups = load_model_ready(model_ready=model_ready, feature_set=args.feature_set)
+    y_enc, orig_to_enc, enc_to_orig = build_label_mapping(y_orig)
 
     print(f"[LOAD] Feature set={args.feature_set}  X={X.shape}  y_orig={y_orig.shape}  groups={groups.shape}")
-    print(f"[LOAD] Label counts (orig): {y_orig.value_counts().to_dict()}")
-    print(f"[LOAD] Label counts (enc):  {y_enc.value_counts().to_dict()}")
+    print(f"[LOAD] Label counts (orig): {summarize_counts(y_orig)}")
+    print(f"[LOAD] Label counts (enc):  {summarize_counts(y_enc)}")
     print(f"[MAP]  orig_to_enc: {orig_to_enc}")
 
-    run_tuning(
-        X=X,
-        y_orig=y_orig,
-        y_enc=y_enc,
-        groups=groups,
-        out_dir=out_dir,
-        seed=args.seed,
-        n_iter=args.n_iter,
-        n_splits=args.splits,
-        n_jobs=args.n_jobs,
-        label_maps=label_maps,
-    )
+    specs = build_models_and_spaces(random_state=args.seed)
+
+    rows: List[Dict[str, Any]] = []
+    best_models: Dict[str, Any] = {}
+
+    for spec in specs:
+        res = run_tuning_one(
+            X=X,
+            y_orig=y_orig,
+            y_enc=y_enc,
+            groups=groups,
+            spec=spec,
+            n_iter=args.n_iter,
+            splits=args.splits,
+            seed=args.seed,
+            n_jobs=args.n_jobs,
+        )
+        rows.append({
+            "Feature Set": args.feature_set,
+            "Model": res["Model"],
+            "CV Macro F1": res["CV Macro F1"],
+            "Balanced Acc": res["Balanced Acc"],
+        })
+        best_models[res["Model"]] = {
+            "cv_macro_f1": res["CV Macro F1"],
+            "balanced_acc": res["Balanced Acc"],
+            "best_params": res["Best Params"],
+            # record if model used encoded labels
+            "y_used": "enc" if next(s for s in specs if s.name == res["Model"]).use_encoded_y else "orig",
+        }
+
+    leaderboard = pd.DataFrame(rows).sort_values(["CV Macro F1", "Balanced Acc"], ascending=False)
+
+    label_mapping = {
+        "orig_to_enc": orig_to_enc,
+        "enc_to_orig": enc_to_orig,
+        "note": "XGBoost (and CatBoost if enabled) were tuned using encoded labels 0..K-1. Others used original labels.",
+    }
+
+    save_outputs(out_dir=out_dir, leaderboard=leaderboard, best_models=best_models, label_mapping=label_mapping)
 
     return 0
 

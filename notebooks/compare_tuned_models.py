@@ -1,49 +1,60 @@
 #!/usr/bin/env python3
-"""
-Step 14 — Compare tuned models across feature sets.
 
-Creates:
-  results/tuning/model_comparison.csv
+"""
+Compare tuned models across feature sets
 """
 
 from pathlib import Path
 import pandas as pd
 
+BASE_DIR = Path("results/tuning")
 
-def load_leaderboard(path: Path, feature_set: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df = df[["model", "best_macro_f1", "best_bal_acc"]].copy()
-    df["feature_set"] = feature_set
-    return df
+rows = []
 
+print("\n=== Tuned Model Comparison ===\n")
 
-def main():
-    base = Path("results/tuning")
+for fs_dir in BASE_DIR.iterdir():
+    if not fs_dir.is_dir():
+        continue
 
-    theory_path = base / "theory" / "leaderboard.csv"
-    all_path = base / "all" / "leaderboard.csv"
+    leaderboard_path = fs_dir / "leaderboard.csv"
 
-    df_theory = load_leaderboard(theory_path, "theory")
-    df_all = load_leaderboard(all_path, "all")
+    if not leaderboard_path.exists():
+        continue
 
-    df = pd.concat([df_theory, df_all], ignore_index=True)
+    df = pd.read_csv(leaderboard_path)
 
+    # -----------------------------
+    # 🔧 FIX COLUMN NAMES
+    # -----------------------------
     df = df.rename(columns={
         "model": "Model",
-        "feature_set": "Feature Set",
         "best_macro_f1": "CV Macro F1",
         "best_bal_acc": "Balanced Acc"
     })
 
-    df = df.sort_values("CV Macro F1", ascending=False)
+    # If Model column still missing, try fallback
+    if "Model" not in df.columns:
+        print(f"[WARN] No 'Model' column in {leaderboard_path}")
+        print("Columns found:", df.columns.tolist())
+        continue
 
-    out_path = base / "model_comparison.csv"
-    df.to_csv(out_path, index=False)
+    df["Feature Set"] = fs_dir.name
 
-    print("\n=== Tuned Model Comparison ===\n")
-    print(df.to_string(index=False))
-    print(f"\nSaved to: {out_path}")
+    df = df[["Model", "CV Macro F1", "Balanced Acc", "Feature Set"]]
 
+    rows.append(df)
 
-if __name__ == "__main__":
-    main()
+# Combine all
+final_df = pd.concat(rows, ignore_index=True)
+
+# Sort by best model
+final_df = final_df.sort_values("CV Macro F1", ascending=False)
+
+print(final_df.to_string(index=False))
+
+# Save
+out_path = BASE_DIR / "model_comparison.csv"
+final_df.to_csv(out_path, index=False)
+
+print("\nSaved to:", out_path)
